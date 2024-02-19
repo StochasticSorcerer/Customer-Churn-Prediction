@@ -1,0 +1,622 @@
+---
+title: "Customer Churn Prediction"
+author: "Luke Andrade"
+format:
+  html:
+    toc: true
+    toc-location: left-body
+    toc-depth: 4
+    toc-expand: 2
+    toc-title: Contents
+    html-math-method: katex
+    theme: darkly
+    page-layout: full
+editor: visual
+---
+
+```{r}
+#| include: False
+knitr::opts_chunk$set(warning = F, message = F)
+```
+
+## About
+
+![](Steve.jpg){fig-align="center" width="250"}
+
+As Steve the Hedgehog was reading about fixed income mathematics, we suddenly got curious as to what sort of variables would be useful in predicting if a customer will churn. Coincidentally, although he was late to it, Kaggle's January 2024 Playground Series Competition was about [binary classification with a bank churn dataset.](https://www.kaggle.com/competitions/playground-series-s4e1) In this notebook, Steve analyzes bank churn data and creates models to answer his question.
+
+## Set-Up
+
+```{r}
+set.seed(776)
+```
+
+### Packages
+
+```{r}
+library(tidyverse)
+library(gt)
+library(data.table)
+library(mltools)
+library(gridExtra)
+library(glmnet)
+library(pROC)
+library(caret)
+library(xgboost)
+```
+
+### Data
+
+The data being used consists of the following features
+
+-   Customer ID: A unique identifier for each customer
+-   Surname: The customer's surname or last name
+-   Credit Score: A numerical value representing the customer's credit score
+-   Geography: The country where the customer resides (France, Spain or Germany)
+-   Gender: The customer's gender (Male or Female)
+-   Age: The customer's age
+-   Tenure: The number of years the customer has been with the bank
+-   Balance: The customer's account balance
+-   NumOfProducts: The number of bank products the customer uses (e.g., savings account, credit card)
+-   HasCrCard: Whether the customer has a credit card (1 = yes, 0 = no)
+-   IsActiveMember: Whether the customer is an active member (1 = yes, 0 = no)
+-   EstimatedSalary: The estimated salary of the customer
+-   Exited: Whether the customer has churned (1 = yes, 0 = no)
+
+```{r}
+train <- read_csv('train.csv')
+head(train)
+```
+
+First Steve wants to check the distribution of the data and the amount of NA values.
+
+```{r}
+summary(train)
+```
+
+The summary() function didn't return any NA values but he check's it another way just to be sure.
+
+```{r}
+train %>% summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+Steve noticed that there are no NA values that must be removed or imputed so he continues.
+
+Next he checks the string variables to see if any cleaning has be done.
+
+```{r}
+train %>% distinct(Surname)
+```
+
+Steve wonders if he can potentially use the starting letter and length of surnames in his analysis.
+
+```{r}
+train$FirstLetter <- str_extract(train$Surname, '[:alpha:]')
+train$NameLength <- nchar(train$Surname)
+```
+
+```{r}
+train %>% distinct(Geography)
+```
+
+```{r}
+train %>% distinct(Gender)
+```
+
+There appears to be no issues with the Geography and Gender variables so Steve will continue to the EDA portion. But first, he creates vectors that contains the column names split by variable type. This could potentially be useful later on.
+
+```{r}
+numeric <- c('CreditScore', 'Age', 'Tenure', 'Balance', 'EstimatedSalary', 'NumOfProducts', 'NameLength')
+binary <- c('HasCrCard', 'IsActiveMember', 'Exited')
+character <- c('Surname', 'Geography', 'Gender', 'FirstLetter')
+```
+
+## Exploratory Data Analysis
+
+#### Credit Score Distribution
+
+```{r}
+ggplot(train, aes(x = CreditScore)) +
+  geom_histogram(fill = 'cornflowerblue') +
+  labs(title = 'Distribution of Credit Score', x = 'Credit Score') +
+  theme_classic()
+```
+
+The credit score appears to be left skewed with a mean of `r round(mean(train$CreditScore), 0)`.
+
+#### Age Distribution
+
+```{r}
+ggplot(train, aes(x = Age)) +
+  geom_histogram(fill = 'cornflowerblue') +
+  labs(title = 'Distribution of Age', x = 'Age') +
+  theme_classic()
+```
+
+Age appears to be right skewed with a mean of `r round(mean(train$Age), 0)`.
+
+#### Tenure Distribution
+
+```{r}
+ggplot(train, aes(x = Tenure)) +
+  geom_histogram(fill = 'cornflowerblue') +
+  labs(title = 'Distribution of Tenure', x = 'Tenure') +
+  theme_classic()
+```
+
+Tenure appears to be relatively uniform with the exception of 0 and 10 years being less frequent than the values in the 1-9 range.
+
+#### Balance Distribution
+
+```{r}
+ggplot(train, aes(x = Balance)) +
+  geom_histogram(fill = 'cornflowerblue') +
+  labs(title = 'Distribution of Balance', x = 'Balance') +
+  theme_classic()
+```
+
+Balance appears to follow a tweedie distribution. There are a large amount of values near \$0 and then the rest of the data is normally distributed around `r train %>% filter(Balance > 1000) %>% summarise(mean(Balance)) %>% .[[1]] %>% round(0) %>% format(format = 'f', big.mark = ',') %>% paste0('$', .)`.
+
+#### Estimated Salary Distribution
+
+```{r}
+ggplot(train, aes(x = EstimatedSalary)) +
+  geom_histogram(fill = 'cornflowerblue') +
+  labs(title = 'Distribution of EstimatedSalary', x = 'EstimatedSalary') +
+  theme_classic()
+```
+
+It is hard to describe Estimated Salary in terms of known distributions but it appears to be multi-modal with the modes being at approximately 10k, 60k, 80k, 125k, 140k, and 175k.
+
+#### Name Length Distribution
+
+```{r}
+ggplot(train, aes(x = NameLength)) +
+  geom_histogram(binwidth = 1, fill = 'cornflowerblue') +
+  labs(title = 'Distribution of Name Length', x = 'Name Length') +
+  theme_classic()
+```
+
+The distribution of Name Length is right skewed with a mean of `r round(mean(train$NameLength), 2)`.
+
+#### Number of Products Distribution
+
+```{r}
+ggplot(train, aes(x = NumOfProducts)) +
+  geom_histogram(fill = 'cornflowerblue') +
+  labs(title = 'Distribution of Number of Products', x = 'Number of Products') +
+  theme_classic()
+```
+
+The majority of the values are for 1 and 2 products with a very small proportion being 3 and 4 products.
+
+#### Geography Distribution
+
+```{r}
+count(train, Geography) %>%
+  mutate(Proportion = n / sum(n),
+         Top = cumsum(Proportion)) %>%
+  bind_cols(Bottom = c(0, head(.$Top, n = -1))) %>%
+  mutate(Position = (Top + Bottom) / 2,
+         Label = paste0(Geography, '\n', round(Proportion, 3) * 100, '%')) %>%
+  ggplot(aes(ymax = Top, ymin = Bottom, xmax = 4, xmin = 3, fill = Geography)) +
+  geom_rect(color = 'white') +
+  geom_text(x = 2.3, aes(y = Position, label = Label, color = Geography), size = 5) +
+  coord_polar(theta = 'y') +
+  xlim(c(1,4)) +
+  theme_void() +
+  theme(legend.position = 'none')
+```
+
+The majority of the customers are from France while the rest is split evenly between Spain and Germany.
+
+#### Gender Distribution
+
+```{r}
+count(train, Gender) %>%
+  mutate(Proportion = n / sum(n),
+         Top = cumsum(Proportion)) %>%
+  bind_cols(Bottom = c(0, head(.$Top, n = -1))) %>%
+  mutate(Position = (Top + Bottom) / 2,
+         Label = paste0(Gender, '\n', round(Proportion, 3) * 100, '%')) %>%
+  ggplot(aes(ymax = Top, ymin = Bottom, xmax = 4, xmin = 3, fill = Gender)) +
+  geom_rect(color = 'white') +
+  geom_text(x = 2.3, aes(y = Position, label = Label, color = Gender), size = 5) +
+  coord_polar(theta = 'y') +
+  xlim(c(1,4)) +
+  theme_void() +
+  theme(legend.position = 'none')
+```
+
+There are more men than woman in this population.
+
+#### Name Starting Letter Distribution
+
+```{r}
+table(train$FirstLetter) %>%
+  as.data.frame() %>%
+  mutate(Var1 = fct_reorder(Var1, Freq)) %>%
+  ggplot(aes(Var1, Freq)) +
+  geom_segment(aes(x = Var1, xend = Var1, y = 0, yend = Freq), color = 'skyblue') +
+  geom_point(size = 4, color = 'cornflowerblue', alpha = 1) +
+  theme_classic() +
+  labs(title = 'Lolipop Plot of Surname Starting Letter', x = 'Letter', y = 'Count')
+```
+
+Here we can see that the most common starting letters are C, T, and H while the least common are Q, V, and J.
+
+#### Proportions for Binary Variables
+
+```{r}
+train %>% select(all_of(binary)) %>% summarise(across(everything(), ~ mean(.)))
+```
+
+From the above table, it is easily seen that 75.4% of customers have a credit card, 49.8% are active members, and 21.1% churn.
+
+#### One-Hot Encoding
+
+Before any bivariate analysis, Steve one-hot-encodes all of the categorical variables.
+
+```{r}
+train_oh <- train %>%
+  mutate(across(c('Geography', 'Gender', 'FirstLetter'), ~ as.factor(.))) %>%
+  as.data.table() %>%
+  one_hot() %>%
+  as.data.frame()
+
+head(train_oh)
+```
+
+#### Correlation Matrix
+
+To start the bivariate analysis Steve create's a correlation matrix
+
+```{r}
+cor_mat <- train_oh %>%
+  select(-c(id, CustomerId, Surname)) %>%
+  cor() %>%
+  round(2)
+
+head(cor_mat)
+```
+
+The full matrix is a bit daunting so he decides to look at Exited specifically.
+
+```{r}
+cor_mat[,'Exited']
+```
+
+There is some positive correlation with Germany, Female, Age, and Balance. There is also some negative correlation with France, Male, NumOfProducts, and IsActiveMember.
+
+#### Histograms Grouped by Churned
+
+```{r}
+churn_histograms <- list()
+
+for(var in numeric){
+  churn_histograms[[var]] <- ggplot(train_oh, aes(.data[[var]], fill = as.factor(Exited))) +
+    geom_histogram(aes(y = after_stat(density)), bins = 40) +
+    geom_density(alpha = 0.5) +
+    theme_void() +
+    theme(legend.position = 'none') +
+    labs(title = var)
+}
+
+grid.arrange(grobs = churn_histograms, ncol = 4)
+```
+
+Based on the histograms and densities, it is clear that Age and NumOfProducts have different distributions. For NumOfProducts, the distributions are different specifically at 2 products.
+
+Thus Steve will create a feature out of this and check it's correlation with Exited.
+
+```{r}
+train_oh$two_prod <- ifelse(train_oh$NumOfProducts == 2, 1, 0)
+cor(train_oh$two_prod, train_oh$Exited)
+```
+
+#### Has Credit Card vs Churn
+
+Steve wants to check if there is a difference in Churn proportion between people who do and do not have a credit card.
+
+```{r}
+hcc_table <- train_oh %>%
+  select(Exited, HasCrCard) %>%
+  group_by(HasCrCard) %>%
+  summarise(`Churn Proportion` = mean(Exited),
+            `Sample Size` = n())
+
+hcc_table
+```
+
+The proportions look very similar but lets check if the difference is statistically significant. With such large sample sizes Steve can assumes that they will be statistically significant but he will check regardless.
+
+```{r}
+p1 <- hcc_table[[1,2]]
+p2 <- hcc_table[[2,2]]
+n1 <- hcc_table[[1,3]]
+n2 <- hcc_table[[2,3]]
+
+z_hcc <- (p1 - p2) / sqrt(p1*(1-p1)/n1 + p2*(1-p2)/n2)
+pval_hcc <- 1 - pnorm(z_hcc)
+```
+
+With a test statistic of `r z_hcc` and a p-value of `r pval_hcc`, the difference between the two proportions is statistically significant.
+
+The above could have also been checked by running a single variable ANOVA.
+
+```{r}
+hcc_aov <- aov(Exited ~ HasCrCard, data = train_oh)
+anova(hcc_aov)
+```
+
+As shown previously, the difference between the means is statistically significant.
+
+#### Is Active Member vs Churn
+
+Steve will follow the same process for Is Active Member as he did for Has Credit Card.
+
+```{r}
+iam_table <- train_oh %>%
+  select(Exited, IsActiveMember) %>%
+  group_by(IsActiveMember) %>%
+  summarise(`Churn Proportion` = mean(Exited),
+            `Sample Size` = n())
+
+iam_table
+```
+
+```{r}
+p1 <- iam_table[[1,2]]
+p2 <- iam_table[[2,2]]
+n1 <- iam_table[[1,3]]
+n2 <- iam_table[[2,3]]
+
+z_iam <- (p1 - p2) / sqrt(p1*(1-p1)/n1 + p2*(1-p2)/n2)
+pval_iam <- 1 - pnorm(z_iam)
+```
+
+With a test statistic of `r z_iam` and a p-value of `r pval_iam`, the difference between the two proportions is statistically significant.
+
+```{r}
+iam_aov <- aov(Exited ~ IsActiveMember, data = train_oh)
+anova(iam_aov)
+```
+
+Again, ANOVA shows the same results.
+
+#### Tenure vs Balance
+
+Steve is curious to see whether the mean Balance is different per level of Tenure.
+
+```{r}
+train_oh %>%
+  group_by(Tenure) %>%
+  summarise(mean(Balance))
+```
+
+It does not, so he will not be including an interaction term.
+
+Steve recalls the distribution of Balance that he showed earlier, there was a clear separation of two groups. One that had values close to zero, and one that had a large value that was approximately normally distributed. He decides to create an indicator variable to separate the two cases then check the correlation with Exited.
+
+```{r}
+train_oh <- train_oh %>%
+  mutate(BalanceGroup = ifelse(Balance == 0, 0, 1))
+
+cor(train_oh$Balance, train_oh$Exited)
+cor(train_oh$BalanceGroup, train_oh$Exited)
+```
+
+Even though the linear correlation for BalanceGroup is larger than Balance, Steve is leaning more towards Balance being more useful because it should give more information. However, the modeling can prove otherwise later.
+
+Steve checks the correlation of Balance when the data is subsetted to only non-zero Balance.
+
+```{r}
+nonzero_balance <- train_oh %>%
+  filter(BalanceGroup == 1)
+
+cor(nonzero_balance$Balance, nonzero_balance$Exited)
+```
+
+Steve can see that Balance doesn't correlate with Exited for non-zero values. Hence, Steve really should just consider the indicator variable.
+
+#### Analysis Summary
+
+Based on the analysis, Steve will be modeling with the following variables
+
+-   Geography_Germany : Indicator variable for if the customer is from Germany.
+-   Geography_France : Indicator variable for if the customer is from France.
+-   Gender_Female : Indicator variable for if the customer is female (Gender_Male will yield the same results).
+-   Age : Age of the customer.
+-   BalanceGroup: Indicator for if Balance is non-zero.
+-   IsActiveMember : If the customer is an active member.
+-   two_prod : Indicator variable for if the customer has 2 products.
+
+```{r}
+train2 <- train_oh %>%
+  select(Geography_Germany, Geography_France, Gender_Female, Age, BalanceGroup, IsActiveMember, two_prod, Exited)
+```
+
+## Modeling
+
+Since this task is a supervised learning task, Steve will try a logistic regression model and see if boosting or bagging adds any value.
+
+He will be creating 3 models, submitting each model's predictions to Kaggle, and then comparing the models afterwards.
+
+First Steve's feature engineers his test data and then split both sets into an X and y matrix.
+
+```{r}
+test_data <- read_csv('test.csv') %>%
+  mutate(across(c('Geography', 'Gender'), ~ as.factor(.))) %>%
+  as.data.table() %>%
+  one_hot() %>%
+  as.data.frame() %>%
+  mutate(BalanceGroup = ifelse(Balance == 0, 0, 1),
+         two_prod = ifelse(NumOfProducts == 2, 1, 0)) %>%
+  select(id, Geography_Germany, Geography_France, Gender_Female, Age, BalanceGroup, IsActiveMember, two_prod)
+```
+
+```{r}
+X_train <- train2 %>%
+  select(-Exited) %>%
+  as.matrix()
+
+X_train_s <- train2 %>%
+  select(-Exited) %>%
+  mutate(across(everything(), ~(. - mean(.)) / sd(.))) %>%
+  as.matrix()
+
+y_train <- as.matrix(train2$Exited)
+```
+
+#### Logistic Regression
+
+The first model Steve wants to use is the logistic regression with LASSO for variable selection.
+
+```{r}
+lasso_mod <- cv.glmnet(X_train_s, y_train, family = 'binomial')
+lambda <- lasso_mod$lambda.min
+coef(lasso_mod)
+```
+
+Steve sees that there is 1 sparse coefficient which implies that Geography_France isn't useful but the others are.
+
+So he fixes his matrices to not include Geography_France.
+
+```{r}
+X_train <- X_train[, colnames(X_train) != 'Geography_France']
+X_test <- test_data[, colnames(test_data) != 'Geography_France']
+train2 <- train2 %>% select(-Geography_France)
+```
+
+Now he will run a logistic model that doesn't include Geography_France.
+
+```{r}
+log_mod <- glm(Exited ~ ., data = train2, family = binomial())
+summary(log_mod)
+```
+
+He can see that all of the model coefficients are statistically significant.
+
+Now he wants to out the probabilities of predicting 1 and convert them to value 1 and 0 based on a threshold of 50%.
+
+```{r}
+log_mod_probs <- log_mod$fitted.values
+log_mod_preds <- ifelse(log_mod_probs >= 0.5, 1, 0)
+```
+
+Steve checks the model accuracy. He is particularly interested in the precision which is the proportion of churn predictions which actually churn. It is more detrimental to open an account for a customer who will churn as opposed to opening an account for a customer who won't churn.
+
+Before he does that, he creates a function that takes in actual values and predictions to calculate all of the necessary classification metrics.
+
+```{r}
+class_eval <- function(actual, predicted){
+  conf_mat <- table(actual, predicted)
+  TP <- conf_mat[2,2]
+  TN <- conf_mat[1,1]
+  FP <- conf_mat[1,2]
+  FN <- conf_mat[2,1]
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  precision <- TP / (TP + FP)
+  recall <- TP / (TP + FN)
+  F1 <- 2 * (precision * recall) / (precision + recall)
+  roc_obj <- roc(actual, predicted)
+  ret_lst <- list(conf_mat = conf_mat, TP = TP, TN = TN, FP = FP, FN = FN, accuracy = accuracy, precision = precision, recall = recall, F1 = F1, roc = roc_obj)
+  return(ret_lst)
+}
+```
+
+```{r}
+log_mod_diagnostics <- class_eval(train2$Exited ,log_mod_preds)
+log_mod_diagnostics
+```
+
+The precision of this model is `r log_mod_diagnostics$precision` and the AUC is `r auc(log_mod_diagnostics$roc)`.
+
+The next step is to create a prediction on the test set and then check the model performance through Kaggle. The Kaggle submission requires the id and the predicted probability.
+
+```{r}
+log_mod_test_probs <- predict(log_mod, X_test, type = 'response')
+log_mod_submission <- data.frame(id = test_data$id, Exited = log_mod_test_probs)
+write_csv(log_mod_submission, file = 'Logistic_Model.csv')
+head(log_mod_submission)
+```
+
+#### Random Forest
+
+Next, he will create a Random Forest model.
+
+```{r}
+rf_tc <- trainControl(method = 'cv', number = 5, classProb = T, search = 'random')
+rf_mod_cv <- train(x = train2 %>% select(-Exited), y = ifelse(train2$Exited == 1, 'Churn', 'NoChurn'), method = 'rf', metric = 'Accuracy', trControl = rf_tc)
+rf_mod_cv
+```
+
+Steve notices that the chosen model's accuracy (randomly selecting 4 variables) yielded an accuracy of `r rf_mod_cv$results[[2,2]]`
+
+Again, he check the classification metrics.
+
+```{r}
+rf_train_preds <- ifelse(predict(rf_mod_cv, train2) == 'Churn', 1, 0)
+rf_mod_diagnostics <- class_eval(train2$Exited, rf_train_preds)
+rf_mod_diagnostics
+```
+
+The precision of this model is `r rf_mod_diagnostics$precision` and the AUC is `r auc(rf_mod_diagnostics$roc)`.
+
+Now he will predict on the test set and submit it to Kaggle.
+
+```{r}
+rf_mod_test_probs <- predict(rf_mod_cv, X_test, type = 'prob')
+rf_mod_submission <- data.frame(id = test_data$id, Exited = rf_mod_test_probs$Churn)
+write_csv(rf_mod_submission, file = 'RF_Model.csv')
+head(rf_mod_submission)
+```
+
+#### XG Boost
+
+The final model Steve will be using is XG Boost.
+
+```{r}
+xg_train <- xgb.DMatrix(data = X_train, label = y_train)
+xg_test <- xgb.DMatrix(data = X_test %>% select(-id) %>% as.matrix())
+xgb_mod <- xgboost(data = xg_train, max.depth = 3, nrounds = 20, objective = 'binary:logistic', verbose = 0)
+rbind(head(xgb_mod$evaluation_log, 5), tail(xgb_mod$evaluation_log, 5))
+```
+
+```{r}
+xgb_train_probs <- predict(xgb_mod, xg_train)
+xgb_train_preds <- ifelse(xgb_train_probs >= 0.5, 1, 0)
+xgb_mod_diagnostics <- class_eval(train2$Exited, xgb_train_preds)
+xgb_mod_diagnostics
+```
+
+The precision of this model is `r xgb_mod_diagnostics$precision` and the AUC is `r auc(xgb_mod_diagnostics$roc)`.
+
+And now for the Kaggle submission.
+
+```{r}
+xgb_mod_test_probs <- predict(xgb_mod, xg_test)
+xgb_mod_submission <- data.frame(id = test_data$id, Exited = xgb_mod_test_probs)
+write_csv(xgb_mod_submission, file = 'XGB_Model.csv')
+head(xgb_mod_submission)
+```
+
+## Results
+
+#### Kaggle Submission Results
+
+![](Kaggle_Results.PNG)
+
+Steve's best model was XGBoost, followed by Logistic Regression, and then Random Forest in last place.
+
+#### Feature Importance
+
+```{r}
+importance <- xgb.importance(attr(xg_train, '.Dimnames')[[2]], xgb_mod)
+
+xgb.ggplot.importance(importance) +
+  theme_classic() +
+  theme(legend.position = 'none')
+```
+
+To answer Steve's initial question, the variables that are most predictive in determining if a customer churns or not are the customer's age and if they have 2 products or not.
